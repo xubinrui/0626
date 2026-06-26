@@ -1,0 +1,1 @@
+{"condition": "ours", "seed": 42, "dataset": "gsm8k", "n_examples": 6, "distinct_1": 0.077520366598778, "distinct_2": 0.22464139344262296, "distinct_3": 0.3364690721649485, "self_bleu": 0.6769207165955186, "skipped": false, "pass_at_1": 0.5, "pass_at_2": 0.5, "pass_at_4": 0.8333333333333334, "pass_at_8": 1.0}

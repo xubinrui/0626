@@ -1,0 +1,14 @@
+{
+  "extends": "e2e_base.json",
+  "dataset": "gsm8k",
+  "dataset_split": "train",
+  "limit_prompts": 10,
+  "num_steps": 10,
+  "max_new_tokens": 256,
+  "eval_max_new_tokens": 256,
+  "eval_datasets": [
+    {"name": "gsm8k", "split": "test", "limit": 32}
+  ],
+  "output_dir": "runs/gsm8k256/{condition}/{seed}",
+  "save_model": false
+}

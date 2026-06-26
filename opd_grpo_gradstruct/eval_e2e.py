@@ -21,6 +21,7 @@ from .train_e2e import load_e2e_config, set_seed
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument("--condition")
     parser.add_argument("--model-path")
     parser.add_argument("--output-dir")
     parser.add_argument("--seed", type=int)
@@ -174,6 +175,8 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
 def main() -> None:
     args = parse_args()
     cfg = load_e2e_config(args.config)
+    if args.condition:
+        cfg["condition"] = args.condition
     if args.seed is not None:
         cfg["seed"] = args.seed
     seed = int(cfg.get("seed", 42))

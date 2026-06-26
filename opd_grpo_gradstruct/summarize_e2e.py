@@ -26,6 +26,22 @@ def read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def annotate_run_rows(rows: list[dict], path: Path, runs: Path) -> list[dict]:
+    rel = path.relative_to(runs)
+    parts = rel.parts
+    run_group = "default"
+    if len(parts) >= 4:
+        run_group = parts[0]
+    run_path = str(path.parent)
+    out = []
+    for row in rows:
+        row = dict(row)
+        row.setdefault("run_group", run_group)
+        row.setdefault("run_path", run_path)
+        out.append(row)
+    return out
+
+
 def main() -> None:
     args = parse_args()
     runs = Path(args.runs_dir)
@@ -33,10 +49,10 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     train_rows = []
     eval_rows = []
-    for train_path in runs.glob("*/*/train.jsonl"):
-        train_rows.extend(read_jsonl(train_path))
-    for eval_path in runs.glob("*/*/eval.jsonl"):
-        eval_rows.extend(read_jsonl(eval_path))
+    for train_path in runs.rglob("train.jsonl"):
+        train_rows.extend(annotate_run_rows(read_jsonl(train_path), train_path, runs))
+    for eval_path in runs.rglob("eval.jsonl"):
+        eval_rows.extend(annotate_run_rows(read_jsonl(eval_path), eval_path, runs))
     train = pd.DataFrame(train_rows)
     evals = pd.DataFrame(eval_rows)
     if not evals.empty:
@@ -44,11 +60,12 @@ def main() -> None:
         skipped = evals["skipped"].astype(bool) if "skipped" in evals.columns else False
         gsm = evals[(evals.get("dataset") == "gsm8k") & (~skipped)]
         if not gsm.empty and {"pass_at_1", "pass_at_8"}.issubset(gsm.columns):
-            agg = gsm.groupby("condition").agg(pass_at_1=("pass_at_1", "mean"), pass_at_8=("pass_at_8", "mean")).reset_index()
+            agg = gsm.groupby(["run_group", "condition"]).agg(pass_at_1=("pass_at_1", "mean"), pass_at_8=("pass_at_8", "mean")).reset_index()
             plt.figure(figsize=(6, 4))
             plt.scatter(agg["pass_at_8"], agg["pass_at_1"])
             for _, row in agg.iterrows():
-                plt.annotate(row["condition"], (row["pass_at_8"], row["pass_at_1"]))
+                label = row["condition"] if row["run_group"] == "default" else f"{row['run_group']}/{row['condition']}"
+                plt.annotate(label, (row["pass_at_8"], row["pass_at_1"]))
             plt.xlabel("Pass@8")
             plt.ylabel("Pass@1")
             plt.tight_layout()
@@ -58,7 +75,7 @@ def main() -> None:
         pd.DataFrame().to_csv(out / "final_summary.csv", index=False)
 
     if not train.empty:
-        speed = train.groupby(["condition", "seed"]).agg(
+        speed = train.groupby(["run_group", "condition", "seed"]).agg(
             wall_seconds_mean=("wall_seconds", "mean"),
             wall_seconds_std=("wall_seconds", "std"),
             peak_memory_mb_max=("peak_memory_mb", "max"),
@@ -67,9 +84,10 @@ def main() -> None:
         )
         speed.to_csv(out / "speed_memory_table.csv")
         plt.figure(figsize=(8, 4))
-        for cond, grp in train.groupby("condition"):
+        for (run_group, cond), grp in train.groupby(["run_group", "condition"]):
             grp = grp.sort_values("step")
-            plt.plot(grp["step"], grp["reward_mean"], label=cond)
+            label = cond if run_group == "default" else f"{run_group}/{cond}"
+            plt.plot(grp["step"], grp["reward_mean"], label=label)
         plt.xlabel("step")
         plt.ylabel("reward")
         plt.legend()

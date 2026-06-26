@@ -151,20 +151,77 @@ def build_component_gradients(
     rollout_advantages: list[float],
     lambda_joint: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat_p, flat_tau, flat_tokens, adv = flatten_gradient_inputs(
+        probs, teacher_probs, token_ids, valid_mask, rollout_advantages
+    )
+    g_grpo, g_opd, g_joint = build_needed_component_gradients(
+        flat_p,
+        flat_tau,
+        flat_tokens,
+        adv,
+        lambda_joint,
+        need_grpo=True,
+        need_opd=True,
+        need_joint=True,
+    )
+    return g_grpo, g_opd, g_joint, flat_tokens
+
+
+def flatten_gradient_inputs(
+    probs: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    token_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    rollout_advantages: list[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     flat_p = probs[valid_mask].float()
     flat_tau = teacher_probs[valid_mask].float()
     flat_tokens = token_ids[valid_mask]
     adv = flat_advantages(valid_mask, rollout_advantages, flat_p.device)
+    return flat_p, flat_tau, flat_tokens, adv
+
+
+def build_needed_component_gradients(
+    flat_p: torch.Tensor,
+    flat_tau: torch.Tensor,
+    flat_tokens: torch.Tensor,
+    adv: torch.Tensor,
+    lambda_joint: float,
+    *,
+    need_grpo: bool,
+    need_opd: bool,
+    need_joint: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows = torch.arange(flat_tokens.numel(), device=flat_p.device)
 
-    g_opd = flat_p - flat_tau
-    g_grpo = flat_p * adv[:, None]
-    if flat_tokens.numel():
-        g_grpo[rows, flat_tokens] -= adv
-    g_joint = flat_p - (1.0 - lambda_joint) * flat_tau
-    if flat_tokens.numel():
-        g_joint[rows, flat_tokens] -= lambda_joint * adv
-    return g_grpo, g_opd, g_joint, flat_tokens
+    empty = torch.empty(0, device=flat_p.device, dtype=flat_p.dtype)
+    if need_opd:
+        g_opd = flat_p - flat_tau
+    else:
+        g_opd = empty
+    if need_grpo:
+        g_grpo = flat_p * adv[:, None]
+        if flat_tokens.numel():
+            g_grpo[rows, flat_tokens] -= adv
+    else:
+        g_grpo = empty
+    if need_joint:
+        g_joint = flat_p - (1.0 - lambda_joint) * flat_tau
+        if flat_tokens.numel():
+            g_joint[rows, flat_tokens] -= lambda_joint * adv
+    else:
+        g_joint = empty
+    return g_grpo, g_opd, g_joint
+
+
+def needed_gradient_flags(condition: str) -> tuple[bool, bool, bool]:
+    if condition == "b1":
+        return True, False, False
+    if condition == "b2":
+        return False, True, False
+    if condition == "b3":
+        return False, False, True
+    return True, True, False
 
 
 def select_condition_delta(
@@ -355,7 +412,8 @@ def train_one_step(
     sequences = sequences_cpu.to(device)
     outputs = student(sequences)
     logits = outputs.logits[:, prompt_len - 1 : -1, :].float()
-    probs = F.softmax(logits, dim=-1)
+    with torch.no_grad():
+        probs = F.softmax(logits, dim=-1)
     token_ids = sequences[:, prompt_len:]
     if not torch.equal(token_ids.detach().cpu(), teacher_token_ids):
         raise RuntimeError("Teacher/student token id mismatch on shared rollout.")
@@ -363,14 +421,23 @@ def train_one_step(
     valid_mask = valid_mask & teacher_valid_cpu.to(device)
     teacher_probs = teacher_probs_cpu.to(device=device, dtype=torch.float32)
 
-    g_grpo, g_opd, g_joint, _flat_tokens = build_component_gradients(
-        probs=probs,
-        teacher_probs=teacher_probs,
-        token_ids=token_ids,
-        valid_mask=valid_mask,
-        rollout_advantages=advantages,
-        lambda_joint=float(cfg["lambda_joint"]),
+    flat_p, flat_tau, flat_tokens, flat_adv = flatten_gradient_inputs(
+        probs, teacher_probs, token_ids, valid_mask, advantages
     )
+    token_entropy = -(flat_p.clamp_min(1e-30) * flat_p.clamp_min(1e-30).log()).sum(dim=-1)
+    kl = (flat_p.clamp_min(1e-30) * (flat_p.clamp_min(1e-30).log() - flat_tau.clamp_min(1e-30).log())).sum(dim=-1)
+    need_grpo, need_opd, need_joint = needed_gradient_flags(condition)
+    g_grpo, g_opd, g_joint = build_needed_component_gradients(
+        flat_p=flat_p,
+        flat_tau=flat_tau,
+        flat_tokens=flat_tokens,
+        adv=flat_adv,
+        lambda_joint=float(cfg["lambda_joint"]),
+        need_grpo=need_grpo,
+        need_opd=need_opd,
+        need_joint=need_joint,
+    )
+    del flat_p, flat_tau, flat_adv
     delta, route_meta = select_condition_delta(condition, g_grpo, g_opd, g_joint, cfg, rng)
     direction_before, direction_after, direction_delta, direction_ok, direction_active = reward_direction_sanity(
         logits=logits,
@@ -385,12 +452,8 @@ def train_one_step(
     if int(valid_mask.sum().item()) > 0:
         grad_logits[valid_mask] = delta / float(valid_mask.sum().item())
 
-    token_entropy = -(probs[valid_mask].clamp_min(1e-30) * probs[valid_mask].clamp_min(1e-30).log()).sum(dim=-1)
-    kl = (
-        probs[valid_mask].clamp_min(1e-30)
-        * (probs[valid_mask].clamp_min(1e-30).log() - teacher_probs[valid_mask].clamp_min(1e-30).log())
-    ).sum(dim=-1)
     loss_proxy = float((logits.detach()[valid_mask] * grad_logits.detach()[valid_mask]).sum().item())
+    del delta, g_grpo, g_opd, g_joint, probs, teacher_probs
     inject_logit_gradient(logits, grad_logits)
     gnorm = grad_norm(student)
     optimizer.step()
