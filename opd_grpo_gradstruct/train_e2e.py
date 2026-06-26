@@ -37,6 +37,11 @@ class StepResult:
     loss_proxy: float
     reward_mean: float
     pass_at_group_proxy: float
+    reward_direction_before: float
+    reward_direction_after: float
+    reward_direction_delta: float
+    reward_direction_ok: bool
+    reward_direction_active: bool
     hard_fraction: float
     recon_error: float
     routing_svd_seconds: float
@@ -279,6 +284,37 @@ def grad_norm(model) -> float:
     return total**0.5
 
 
+def reward_surrogate_from_logits(
+    flat_logits: torch.Tensor,
+    flat_tokens: torch.Tensor,
+    advantages: torch.Tensor,
+) -> torch.Tensor:
+    if flat_tokens.numel() == 0:
+        return torch.tensor(0.0, device=flat_logits.device, dtype=torch.float32)
+    rows = torch.arange(flat_tokens.numel(), device=flat_logits.device)
+    logp = F.log_softmax(flat_logits.float(), dim=-1)[rows, flat_tokens]
+    return (advantages.float() * logp).mean()
+
+
+def reward_direction_sanity(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    delta: torch.Tensor,
+    rollout_advantages: list[float],
+    eps: float,
+    tolerance: float,
+) -> tuple[float, float, float, bool, bool]:
+    flat_logits = logits.detach()[valid_mask].float()
+    flat_tokens = token_ids[valid_mask]
+    advantages = flat_advantages(valid_mask, rollout_advantages, flat_logits.device)
+    active = bool(advantages.abs().sum().item() > 0.0)
+    before = reward_surrogate_from_logits(flat_logits, flat_tokens, advantages)
+    after = reward_surrogate_from_logits(flat_logits - eps * delta.detach().float(), flat_tokens, advantages)
+    diff = float((after - before).item())
+    return float(before.item()), float(after.item()), diff, bool(diff >= -tolerance), active
+
+
 def train_one_step(
     student,
     teacher,
@@ -333,6 +369,15 @@ def train_one_step(
         lambda_joint=float(cfg["lambda_joint"]),
     )
     delta, route_meta = select_condition_delta(condition, g_grpo, g_opd, g_joint, cfg, rng)
+    direction_before, direction_after, direction_delta, direction_ok, direction_active = reward_direction_sanity(
+        logits=logits,
+        token_ids=token_ids,
+        valid_mask=valid_mask,
+        delta=delta,
+        rollout_advantages=advantages,
+        eps=float(cfg.get("reward_direction_probe_eps", 1e-3)),
+        tolerance=float(cfg.get("reward_direction_tolerance", 1e-8)),
+    )
     grad_logits = torch.zeros_like(logits, dtype=torch.float32)
     if int(valid_mask.sum().item()) > 0:
         grad_logits[valid_mask] = delta / float(valid_mask.sum().item())
@@ -357,6 +402,11 @@ def train_one_step(
         loss_proxy=loss_proxy,
         reward_mean=float(np.mean(rewards)) if rewards else 0.0,
         pass_at_group_proxy=float(any(r > 0.0 for r in rewards)),
+        reward_direction_before=direction_before,
+        reward_direction_after=direction_after,
+        reward_direction_delta=direction_delta,
+        reward_direction_ok=direction_ok,
+        reward_direction_active=direction_active,
         hard_fraction=float(route_meta["hard_fraction"]),
         recon_error=float(route_meta["recon_error"]),
         routing_svd_seconds=float(route_meta["routing_svd_seconds"]),

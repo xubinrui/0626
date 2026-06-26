@@ -33,6 +33,8 @@
   "rpca_max_iter": 100,
   "collapse_entropy_frac": 0.4,
   "collapse_pass8_drop": 0.25,
+  "reward_direction_probe_eps": 0.001,
+  "reward_direction_tolerance": 1e-08,
   "pass_k": [
     1,
     2,
@@ -42,6 +44,7 @@
   "eval_temperature": 0.8,
   "eval_top_p": 0.95,
   "eval_max_new_tokens": 64,
+  "eval_offline_only": true,
   "eval_datasets": [
     {
       "name": "gsm8k",
@@ -51,15 +54,17 @@
     {
       "name": "math",
       "split": "test",
-      "limit": 8
+      "limit": 2,
+      "local_path": "data/eval/math_smoke.jsonl"
     },
     {
       "name": "aime2024",
       "split": "train",
-      "limit": 8
+      "limit": 2,
+      "local_path": "data/eval/aime2024_smoke.jsonl"
     }
   ],
   "condition": "b3",
-  "output_dir": "runs/b3/42",
+  "output_dir": "runs/b3/{seed}",
   "compress_easy_tokens": false
 }

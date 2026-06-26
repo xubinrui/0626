@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import random
@@ -26,10 +27,76 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_eval_examples(dataset: str, split: str, limit: int, seed: int, offline_only: bool = False) -> list[PromptExample]:
+def _field(row: dict[str, Any], names: list[str]) -> str:
+    for name in names:
+        value = row.get(name)
+        if value is not None and str(value).strip():
+            return str(value)
+    content = row.get("content")
+    if isinstance(content, dict):
+        return _field(content, names)
+    return ""
+
+
+def _examples_from_rows(rows: list[dict[str, Any]], dataset: str, limit: int, seed: int) -> list[PromptExample]:
+    indices = list(range(len(rows)))
+    random.Random(seed).shuffle(indices)
+    out: list[PromptExample] = []
+    for out_idx, ds_idx in enumerate(indices[: min(limit, len(indices))]):
+        row = rows[ds_idx]
+        question = _field(row, ["question", "problem", "instruction", "prompt"])
+        answer = _field(row, ["answer", "solution", "response", "target", "final_answer"])
+        if question and answer:
+            out.append(PromptExample(idx=out_idx, question=question, answer=answer, dataset=dataset))
+    return out
+
+
+def load_jsonl_or_csv(path: str | Path, dataset: str, limit: int, seed: int) -> list[PromptExample]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    if p.suffix.lower() == ".csv":
+        with p.open("r", encoding="utf-8") as f:
+            rows = [dict(row) for row in csv.DictReader(f)]
+    else:
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    return _examples_from_rows(rows, dataset, limit, seed)
+
+
+def default_local_eval_path(dataset: str) -> Path | None:
+    root = Path(__file__).resolve().parent.parent
+    name = dataset.lower().replace("-", "")
+    candidates = {
+        "math": root / "data" / "eval" / "math_smoke.jsonl",
+        "aime2024": root / "data" / "eval" / "aime2024_smoke.jsonl",
+    }
+    return candidates.get(name)
+
+
+def load_eval_examples(
+    dataset: str,
+    split: str,
+    limit: int,
+    seed: int,
+    offline_only: bool = False,
+    local_path: str | None = None,
+) -> list[PromptExample]:
     name = dataset.lower()
     if name == "gsm8k":
         return load_prompt_examples("gsm8k", split, limit, seed)
+    if local_path:
+        examples = load_jsonl_or_csv(local_path, dataset, limit, seed)
+        if examples:
+            return examples
+    default_path = default_local_eval_path(dataset)
+    if default_path is not None:
+        examples = load_jsonl_or_csv(default_path, dataset, limit, seed)
+        if examples:
+            return examples
     if offline_only:
         return []
     try:
@@ -46,13 +113,7 @@ def load_eval_examples(dataset: str, split: str, limit: int, seed: int, offline_
             rows = [{"question": r.get("Problem", r.get("problem", "")), "answer": str(r.get("Answer", r.get("answer", "")))} for r in ds]
     except Exception:
         rows = []
-    indices = list(range(len(rows)))
-    random.Random(seed).shuffle(indices)
-    out: list[PromptExample] = []
-    for out_idx, ds_idx in enumerate(indices[: min(limit, len(indices))]):
-        row = rows[ds_idx]
-        out.append(PromptExample(idx=out_idx, question=row["question"], answer=row["answer"], dataset=dataset))
-    return out
+    return _examples_from_rows(rows, dataset, limit, seed)
 
 
 def reward_for_dataset(dataset: str, generation: str, answer: str) -> float:
@@ -141,6 +202,7 @@ def main() -> None:
             int(dataset_cfg.get("limit", 8)),
             seed,
             offline_only=bool(cfg.get("eval_offline_only", True)),
+            local_path=dataset_cfg.get("local_path"),
         )
         if not examples:
             append_jsonl(eval_path, {"condition": condition, "seed": seed, "dataset": dataset, "skipped": True, "reason": "no eval examples available"})
