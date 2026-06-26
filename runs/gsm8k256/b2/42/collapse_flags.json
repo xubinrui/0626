@@ -1,0 +1,17 @@
+[
+  {
+    "step": 1,
+    "entropy": 0.1802120981225812,
+    "pass_at_group_proxy": 0.0
+  },
+  {
+    "step": 6,
+    "entropy": 0.22148953938039995,
+    "pass_at_group_proxy": 0.0
+  },
+  {
+    "step": 9,
+    "entropy": 0.23317991653151182,
+    "pass_at_group_proxy": 0.0
+  }
+]
