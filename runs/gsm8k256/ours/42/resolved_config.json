@@ -35,6 +35,7 @@
   "collapse_pass8_drop": 0.25,
   "reward_direction_probe_eps": 0.001,
   "reward_direction_tolerance": 1e-08,
+  "metric_chunk_rows": 16,
   "pass_k": [
     1,
     2,

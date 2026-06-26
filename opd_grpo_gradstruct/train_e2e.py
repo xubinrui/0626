@@ -356,6 +356,48 @@ def reward_surrogate_from_logits(
     return (advantages.float() * logp).mean()
 
 
+def entropy_kl_means_chunked(flat_p: torch.Tensor, flat_tau: torch.Tensor, chunk_rows: int) -> tuple[float, float]:
+    if flat_p.numel() == 0:
+        return 0.0, 0.0
+    chunk_rows = max(1, int(chunk_rows))
+    entropy_sum = 0.0
+    kl_sum = 0.0
+    n_rows = flat_p.shape[0]
+    with torch.no_grad():
+        for start in range(0, n_rows, chunk_rows):
+            end = min(start + chunk_rows, n_rows)
+            p = flat_p[start:end].float()
+            tau = flat_tau[start:end].float()
+            p_safe = p.clamp_min(1e-30)
+            tau_safe = tau.clamp_min(1e-30)
+            logp = p_safe.log()
+            entropy_sum += float((-(p_safe * logp).sum(dim=-1)).sum().item())
+            kl_sum += float((p_safe * (logp - tau_safe.log())).sum(dim=-1).sum().item())
+    return entropy_sum / n_rows, kl_sum / n_rows
+
+
+def valid_logit_delta_dot_chunked(
+    logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    delta: torch.Tensor,
+    scale: float,
+    chunk_rows: int,
+) -> float:
+    if delta.numel() == 0:
+        return 0.0
+    positions = valid_mask.nonzero(as_tuple=False)
+    chunk_rows = max(1, int(chunk_rows))
+    total = 0.0
+    with torch.no_grad():
+        for start in range(0, positions.shape[0], chunk_rows):
+            end = min(start + chunk_rows, positions.shape[0])
+            pos = positions[start:end]
+            chunk_logits = logits.detach()[pos[:, 0], pos[:, 1], :].float()
+            chunk_delta = delta[start:end].float() * scale
+            total += float((chunk_logits * chunk_delta).sum().item())
+    return total
+
+
 def reward_direction_sanity(
     logits: torch.Tensor,
     token_ids: torch.Tensor,
@@ -364,15 +406,32 @@ def reward_direction_sanity(
     rollout_advantages: list[float],
     eps: float,
     tolerance: float,
+    chunk_rows: int = 16,
 ) -> tuple[float, float, float, bool, bool]:
-    flat_logits = logits.detach()[valid_mask].float()
+    positions = valid_mask.nonzero(as_tuple=False)
     flat_tokens = token_ids[valid_mask]
-    advantages = flat_advantages(valid_mask, rollout_advantages, flat_logits.device)
+    advantages = flat_advantages(valid_mask, rollout_advantages, logits.device)
     active = bool(advantages.abs().sum().item() > 0.0)
-    before = reward_surrogate_from_logits(flat_logits, flat_tokens, advantages)
-    after = reward_surrogate_from_logits(flat_logits - eps * delta.detach().float(), flat_tokens, advantages)
-    diff = float((after - before).item())
-    return float(before.item()), float(after.item()), diff, bool(diff >= -tolerance), active
+    if positions.numel() == 0:
+        return 0.0, 0.0, 0.0, True, active
+    before_sum = 0.0
+    after_sum = 0.0
+    chunk_rows = max(1, int(chunk_rows))
+    with torch.no_grad():
+        for start in range(0, positions.shape[0], chunk_rows):
+            end = min(start + chunk_rows, positions.shape[0])
+            pos = positions[start:end]
+            chunk_logits = logits.detach()[pos[:, 0], pos[:, 1], :].float()
+            chunk_tokens = flat_tokens[start:end]
+            chunk_adv = advantages[start:end]
+            before = reward_surrogate_from_logits(chunk_logits, chunk_tokens, chunk_adv)
+            after = reward_surrogate_from_logits(chunk_logits - eps * delta[start:end].detach().float(), chunk_tokens, chunk_adv)
+            before_sum += float(before.item()) * (end - start)
+            after_sum += float(after.item()) * (end - start)
+    before_mean = before_sum / positions.shape[0]
+    after_mean = after_sum / positions.shape[0]
+    diff = after_mean - before_mean
+    return before_mean, after_mean, diff, bool(diff >= -tolerance), active
 
 
 def train_one_step(
@@ -424,8 +483,8 @@ def train_one_step(
     flat_p, flat_tau, flat_tokens, flat_adv = flatten_gradient_inputs(
         probs, teacher_probs, token_ids, valid_mask, advantages
     )
-    token_entropy = -(flat_p.clamp_min(1e-30) * flat_p.clamp_min(1e-30).log()).sum(dim=-1)
-    kl = (flat_p.clamp_min(1e-30) * (flat_p.clamp_min(1e-30).log() - flat_tau.clamp_min(1e-30).log())).sum(dim=-1)
+    metric_chunk_rows = int(cfg.get("metric_chunk_rows", 16))
+    entropy_mean, kl_mean = entropy_kl_means_chunked(flat_p, flat_tau, metric_chunk_rows)
     need_grpo, need_opd, need_joint = needed_gradient_flags(condition)
     g_grpo, g_opd, g_joint = build_needed_component_gradients(
         flat_p=flat_p,
@@ -447,12 +506,19 @@ def train_one_step(
         rollout_advantages=advantages,
         eps=float(cfg.get("reward_direction_probe_eps", 1e-3)),
         tolerance=float(cfg.get("reward_direction_tolerance", 1e-8)),
+        chunk_rows=metric_chunk_rows,
     )
     grad_logits = torch.zeros_like(logits, dtype=torch.float32)
     if int(valid_mask.sum().item()) > 0:
         grad_logits[valid_mask] = delta / float(valid_mask.sum().item())
 
-    loss_proxy = float((logits.detach()[valid_mask] * grad_logits.detach()[valid_mask]).sum().item())
+    loss_proxy = valid_logit_delta_dot_chunked(
+        logits,
+        valid_mask,
+        delta,
+        scale=1.0 / float(max(1, int(valid_mask.sum().item()))),
+        chunk_rows=metric_chunk_rows,
+    )
     del delta, g_grpo, g_opd, g_joint, probs, teacher_probs
     inject_logit_gradient(logits, grad_logits)
     gnorm = grad_norm(student)
@@ -476,8 +542,8 @@ def train_one_step(
         hard_fraction=float(route_meta["hard_fraction"]),
         recon_error=float(route_meta["recon_error"]),
         routing_svd_seconds=float(route_meta["routing_svd_seconds"]),
-        entropy=float(token_entropy.mean().item()) if token_entropy.numel() else 0.0,
-        kl_to_teacher=float(kl.mean().item()) if kl.numel() else 0.0,
+        entropy=entropy_mean,
+        kl_to_teacher=kl_mean,
         grad_norm=gnorm,
         peak_memory_mb=peak_memory,
         wall_seconds=time.perf_counter() - step_start,

@@ -33,6 +33,7 @@
   "collapse_pass8_drop": 0.25,
   "reward_direction_probe_eps": 0.001,
   "reward_direction_tolerance": 1e-8,
+  "metric_chunk_rows": 16,
   "pass_k": [1, 2, 4, 8],
   "eval_temperature": 0.8,
   "eval_top_p": 0.95,
