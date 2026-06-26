@@ -5,7 +5,8 @@ cd "$(dirname "$0")/.."
 
 PYTHON_BIN="${PYTHON_BIN:-/data/xuebinrui/miniconda3/envs/loopai/bin/python}"
 SUMMARY_PYTHON_BIN="${SUMMARY_PYTHON_BIN:-python3}"
-GPUS="${GPUS:-1,3,5}"
+GPUS="${GPUS:-2,3,5}"
+MIN_FREE_MB="${MIN_FREE_MB:-22000}"
 SEED="${SEED:-42}"
 NUM_STEPS="${NUM_STEPS:-10}"
 LIMIT_PROMPTS="${LIMIT_PROMPTS:-10}"
@@ -33,6 +34,15 @@ echo "SAVE_MODEL=$SAVE_MODEL RUN_EVAL=$RUN_EVAL USE_FALLBACK_DATA=$USE_FALLBACK_
 echo "HF_DATASETS_OFFLINE=$HF_DATASETS_OFFLINE"
 echo "CONDITIONS=$CONDITIONS CONFIG=$CONFIG"
 nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader || true
+
+IFS=',' read -r -a GPU_IDS <<< "$GPUS"
+for gpu_id in "${GPU_IDS[@]}"; do
+  free_mb="$(nvidia-smi -i "$gpu_id" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')"
+  if [[ "$free_mb" -lt "$MIN_FREE_MB" ]]; then
+    echo "ERROR: GPU $gpu_id has only ${free_mb} MiB free; need at least ${MIN_FREE_MB} MiB. Set GPUS=... to choose emptier cards." >&2
+    exit 1
+  fi
+done
 
 train_args=(--seed "$SEED" --num-steps "$NUM_STEPS" --limit-prompts "$LIMIT_PROMPTS" --max-new-tokens "$MAX_NEW_TOKENS")
 if [[ "$SAVE_MODEL" == "1" ]]; then

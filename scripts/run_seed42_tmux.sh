@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 PYTHON_BIN="${PYTHON_BIN:-/data/xuebinrui/miniconda3/envs/loopai/bin/python}"
 SUMMARY_PYTHON_BIN="${SUMMARY_PYTHON_BIN:-python3}"
-GPUS="${GPUS:-1,3,5}"
+GPUS="${GPUS:-2,3,5}"
 SEED="${SEED:-42}"
 NUM_STEPS="${NUM_STEPS:-1}"
 LIMIT_PROMPTS="${LIMIT_PROMPTS:-1}"
