@@ -482,6 +482,159 @@ def dense_condition_grad_logits_chunked(
     )
 
 
+def build_grpo_opd_numpy_chunked(
+    flat_p: torch.Tensor,
+    flat_tau: torch.Tensor,
+    flat_tokens: torch.Tensor,
+    flat_adv: torch.Tensor,
+    chunk_rows: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    n_rows, vocab = flat_p.shape
+    g_grpo = np.empty((n_rows, vocab), dtype=np.float32)
+    g_opd = np.empty((n_rows, vocab), dtype=np.float32)
+    chunk_rows = max(1, int(chunk_rows))
+    for start in range(0, n_rows, chunk_rows):
+        end = min(start + chunk_rows, n_rows)
+        p = flat_p[start:end].detach().cpu().numpy().astype(np.float32, copy=True)
+        tau = flat_tau[start:end].detach().cpu().numpy().astype(np.float32, copy=False)
+        adv = flat_adv[start:end].detach().cpu().numpy().astype(np.float32, copy=False)
+        tokens = flat_tokens[start:end].detach().cpu().numpy()
+        opd = p - tau
+        grpo = p * adv[:, None]
+        if tokens.size:
+            grpo[np.arange(tokens.size), tokens] -= adv
+        g_opd[start:end] = opd
+        g_grpo[start:end] = grpo
+    return g_grpo, g_opd
+
+
+def select_condition_delta_numpy(
+    condition: str,
+    g_grpo: np.ndarray,
+    g_opd: np.ndarray,
+    cfg: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    start = time.perf_counter()
+    lambda_joint = float(cfg["lambda_joint"])
+    rank = int(cfg.get("lowrank_rank", 32))
+    target_fraction = float(cfg.get("hard_fraction_target", 0.20))
+    min_fraction = float(cfg.get("hard_fraction_min", 0.15))
+    max_fraction = float(cfg.get("hard_fraction_max", 0.25))
+    rpca_topk = int(cfg.get("rpca_topk_cols_per_row", 16))
+    rpca_max_iter = int(cfg.get("rpca_max_iter", 100))
+
+    if condition in {"ours", "ours_minus"}:
+        route = grpo_sparse_support_mask(
+            g_grpo,
+            target_fraction=target_fraction,
+            min_fraction=min_fraction,
+            max_fraction=max_fraction,
+            rpca_topk_cols_per_row=rpca_topk,
+            rpca_max_iter=rpca_max_iter,
+        )
+        routing_source = "grpo_sparse_support"
+    elif condition == "b4":
+        route = opd_magnitude_mask(
+            g_opd,
+            target_fraction=target_fraction,
+            min_fraction=min_fraction,
+            max_fraction=max_fraction,
+        )
+        routing_source = "opd_magnitude"
+    elif condition == "b4b":
+        ours_route = grpo_sparse_support_mask(
+            g_grpo,
+            target_fraction=target_fraction,
+            min_fraction=min_fraction,
+            max_fraction=max_fraction,
+            rpca_topk_cols_per_row=rpca_topk,
+            rpca_max_iter=rpca_max_iter,
+        )
+        route = random_matched_mask(g_grpo.shape[0], ours_route.hard_fraction, rng)
+        routing_source = "random_matched_to_grpo_fraction"
+    else:
+        raise ValueError(f"select_condition_delta_numpy only supports routed conditions, got {condition}")
+
+    hard = route.mask
+    easy = ~hard
+    delta = np.empty_like(g_opd, dtype=np.float32)
+    delta[hard] = g_grpo[hard] + (1.0 - lambda_joint) * g_opd[hard]
+
+    compressed_easy = bool(cfg.get("compress_easy_tokens", condition in {"ours", "b4"}))
+    recon_error = 0.0
+    if int(easy.sum()) > 0 and compressed_easy:
+        recon, recon_error, kept_rank = lowrank_reconstruct(g_opd[easy], rank, rng)
+        delta[easy] = recon
+    else:
+        kept_rank = 0
+        delta[easy] = g_opd[easy]
+
+    elapsed = time.perf_counter() - start
+    return delta, {
+        "hard_fraction": route.hard_fraction,
+        "recon_error": recon_error,
+        "routing_svd_seconds": elapsed,
+        "routing_source": routing_source,
+        "compressed_easy": compressed_easy,
+        "lowrank_rank_kept": kept_rank,
+        "route_threshold": route.threshold,
+        "rpca_rank": route.rpca_rank,
+        "rpca_iters": route.rpca_iters,
+        "rpca_recon_error": route.rpca_recon_error,
+        "route_energy_coverage": route.energy_coverage,
+    }
+
+
+def numpy_delta_grad_logits_chunked(
+    logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    flat_tokens: torch.Tensor,
+    flat_adv: torch.Tensor,
+    delta_np: np.ndarray,
+    eps: float,
+    tolerance: float,
+    chunk_rows: int,
+) -> tuple[torch.Tensor, float, float, float, float, bool, bool]:
+    positions = valid_mask.nonzero(as_tuple=False)
+    n_rows = int(positions.shape[0])
+    grad_logits = torch.zeros_like(logits, dtype=torch.float32)
+    if n_rows == 0:
+        return grad_logits, 0.0, 0.0, 0.0, 0.0, True, False
+    scale = 1.0 / float(n_rows)
+    chunk_rows = max(1, int(chunk_rows))
+    loss_proxy = 0.0
+    before_sum = 0.0
+    after_sum = 0.0
+    active = bool(flat_adv.abs().sum().item() > 0.0)
+    device = logits.device
+    for start in range(0, n_rows, chunk_rows):
+        end = min(start + chunk_rows, n_rows)
+        pos = positions[start:end]
+        delta = torch.from_numpy(delta_np[start:end]).to(device=device, dtype=torch.float32)
+        grad_logits[pos[:, 0], pos[:, 1], :] = delta * scale
+        with torch.no_grad():
+            chunk_logits = logits.detach()[pos[:, 0], pos[:, 1], :].float()
+            loss_proxy += float((chunk_logits * delta * scale).sum().item())
+            before = reward_surrogate_from_logits(chunk_logits, flat_tokens[start:end], flat_adv[start:end])
+            after = reward_surrogate_from_logits(chunk_logits - eps * delta, flat_tokens[start:end], flat_adv[start:end])
+            before_sum += float(before.item()) * (end - start)
+            after_sum += float(after.item()) * (end - start)
+        del delta
+    before_mean = before_sum / n_rows
+    after_mean = after_sum / n_rows
+    direction_delta = after_mean - before_mean
+    return (
+        grad_logits,
+        loss_proxy,
+        before_mean,
+        after_mean,
+        direction_delta,
+        bool(direction_delta >= -tolerance),
+        active,
+    )
+
+
 def reward_direction_sanity(
     logits: torch.Tensor,
     token_ids: torch.Tensor,
@@ -598,41 +751,34 @@ def train_one_step(
         }
         del flat_p, flat_tau, flat_adv
     else:
-        need_grpo, need_opd, need_joint = needed_gradient_flags(condition)
-        g_grpo, g_opd, g_joint = build_needed_component_gradients(
+        g_grpo_np, g_opd_np = build_grpo_opd_numpy_chunked(
             flat_p=flat_p,
             flat_tau=flat_tau,
             flat_tokens=flat_tokens,
-            adv=flat_adv,
-            lambda_joint=float(cfg["lambda_joint"]),
-            need_grpo=need_grpo,
-            need_opd=need_opd,
-            need_joint=need_joint,
+            flat_adv=flat_adv,
+            chunk_rows=metric_chunk_rows,
         )
-        del flat_p, flat_tau, flat_adv
-        delta, route_meta = select_condition_delta(condition, g_grpo, g_opd, g_joint, cfg, rng)
-        direction_before, direction_after, direction_delta, direction_ok, direction_active = reward_direction_sanity(
+        delta_np, route_meta = select_condition_delta_numpy(condition, g_grpo_np, g_opd_np, cfg, rng)
+        del g_grpo_np, g_opd_np, flat_p, flat_tau
+        (
+            grad_logits,
+            loss_proxy,
+            direction_before,
+            direction_after,
+            direction_delta,
+            direction_ok,
+            direction_active,
+        ) = numpy_delta_grad_logits_chunked(
             logits=logits,
-            token_ids=token_ids,
             valid_mask=valid_mask,
-            delta=delta,
-            rollout_advantages=advantages,
+            flat_tokens=flat_tokens,
+            flat_adv=flat_adv,
+            delta_np=delta_np,
             eps=float(cfg.get("reward_direction_probe_eps", 1e-3)),
             tolerance=float(cfg.get("reward_direction_tolerance", 1e-8)),
             chunk_rows=metric_chunk_rows,
         )
-        grad_logits = torch.zeros_like(logits, dtype=torch.float32)
-        if int(valid_mask.sum().item()) > 0:
-            grad_logits[valid_mask] = delta / float(valid_mask.sum().item())
-
-        loss_proxy = valid_logit_delta_dot_chunked(
-            logits,
-            valid_mask,
-            delta,
-            scale=1.0 / float(max(1, int(valid_mask.sum().item()))),
-            chunk_rows=metric_chunk_rows,
-        )
-        del delta, g_grpo, g_opd, g_joint
+        del delta_np, flat_adv
     del probs, teacher_probs
     inject_logit_gradient(logits, grad_logits)
     gnorm = grad_norm(student)
