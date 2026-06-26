@@ -58,6 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--condition")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--num-steps", type=int)
+    parser.add_argument("--limit-prompts", type=int)
+    parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument("--save-model", action=argparse.BooleanOptionalAction)
     parser.add_argument("--output-dir")
     return parser.parse_args()
 
@@ -433,6 +436,12 @@ def main() -> None:
         cfg["seed"] = args.seed
     if args.num_steps is not None:
         cfg["num_steps"] = args.num_steps
+    if args.limit_prompts is not None:
+        cfg["limit_prompts"] = args.limit_prompts
+    if args.max_new_tokens is not None:
+        cfg["max_new_tokens"] = args.max_new_tokens
+    if args.save_model is not None:
+        cfg["save_model"] = args.save_model
     condition = str(cfg["condition"]).lower()
     if condition not in CONDITIONS:
         raise ValueError(f"condition must be one of {sorted(CONDITIONS)}, got {condition}")
