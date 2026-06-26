@@ -1,0 +1,455 @@
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.optim import AdamW, SGD
+from tqdm import trange
+from transformers import AutoModelForCausalLM
+
+from .config import dtype_from_name
+from .data import build_prompt, group_advantages, gsm8k_reward, load_prompt_examples
+from .gradients import token_distributions
+from .modeling import generate_group, load_causal_lm, load_tokenizer
+from .routing import (
+    ConditionId,
+    grpo_sparse_support_mask,
+    lowrank_reconstruct,
+    opd_magnitude_mask,
+    random_matched_mask,
+    rule_hash,
+)
+
+
+CONDITIONS: set[str] = {"b1", "b2", "b3", "b4", "ours", "b4b", "ours_minus"}
+
+
+@dataclass
+class StepResult:
+    loss_proxy: float
+    reward_mean: float
+    pass_at_group_proxy: float
+    hard_fraction: float
+    recon_error: float
+    routing_svd_seconds: float
+    entropy: float
+    kl_to_teacher: float
+    grad_norm: float
+    peak_memory_mb: float
+    wall_seconds: float
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--condition")
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--num-steps", type=int)
+    parser.add_argument("--output-dir")
+    return parser.parse_args()
+
+
+def deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        if key == "extends":
+            continue
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_update(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_e2e_config(path: str | Path) -> dict[str, Any]:
+    cfg_path = Path(path)
+    with cfg_path.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    parent = cfg.get("extends")
+    if parent:
+        parent_path = (cfg_path.parent / parent).resolve()
+        return deep_update(load_e2e_config(parent_path), cfg)
+    return cfg
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_trainable_student(cfg: dict[str, Any]):
+    kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "torch_dtype": dtype_from_name(cfg["student_dtype"]),
+        "low_cpu_mem_usage": True,
+        "device_map": {"": cfg["student_device"]},
+    }
+    model = AutoModelForCausalLM.from_pretrained(cfg["student_model"], **kwargs)
+    model.config.use_cache = False
+    if cfg.get("gradient_checkpointing", True):
+        model.gradient_checkpointing_enable()
+    for param in model.parameters():
+        param.requires_grad_(True)
+    return model
+
+
+def make_optimizer(model, cfg: dict[str, Any]):
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt_name = str(cfg.get("optimizer", "adamw")).lower()
+    lr = float(cfg.get("learning_rate", 1e-6))
+    wd = float(cfg.get("weight_decay", 0.0))
+    if opt_name == "sgd":
+        return SGD(params, lr=lr, weight_decay=wd)
+    if opt_name == "adamw":
+        return AdamW(params, lr=lr, weight_decay=wd)
+    raise ValueError(f"Unsupported optimizer: {opt_name}")
+
+
+def valid_generation_mask(model, target_tokens: torch.Tensor, pad_token_id: int | None) -> torch.Tensor:
+    if pad_token_id is None:
+        valid = torch.ones_like(target_tokens, dtype=torch.bool)
+    else:
+        valid = target_tokens.ne(pad_token_id)
+    eos = getattr(model.config, "eos_token_id", None)
+    if isinstance(eos, int):
+        after_eos = torch.cumsum(target_tokens.eq(eos).int(), dim=1) > 1
+        valid = valid & (~after_eos)
+    return valid
+
+
+def flat_advantages(valid_mask: torch.Tensor, rollout_advantages: list[float], device: torch.device) -> torch.Tensor:
+    row_adv: list[float] = []
+    for row_idx, adv in enumerate(rollout_advantages):
+        row_adv.extend([float(adv)] * int(valid_mask[row_idx].sum().item()))
+    return torch.tensor(row_adv, dtype=torch.float32, device=device)
+
+
+def build_component_gradients(
+    probs: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    token_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    rollout_advantages: list[float],
+    lambda_joint: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat_p = probs[valid_mask].float()
+    flat_tau = teacher_probs[valid_mask].float()
+    flat_tokens = token_ids[valid_mask]
+    adv = flat_advantages(valid_mask, rollout_advantages, flat_p.device)
+    rows = torch.arange(flat_tokens.numel(), device=flat_p.device)
+
+    g_opd = flat_p - flat_tau
+    g_grpo = flat_p * adv[:, None]
+    if flat_tokens.numel():
+        g_grpo[rows, flat_tokens] -= adv
+    g_joint = flat_p - (1.0 - lambda_joint) * flat_tau
+    if flat_tokens.numel():
+        g_joint[rows, flat_tokens] -= lambda_joint * adv
+    return g_grpo, g_opd, g_joint, flat_tokens
+
+
+def select_condition_delta(
+    condition: ConditionId,
+    g_grpo: torch.Tensor,
+    g_opd: torch.Tensor,
+    g_joint: torch.Tensor,
+    cfg: dict[str, Any],
+    rng: np.random.Generator,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    start = time.perf_counter()
+    lambda_joint = float(cfg["lambda_joint"])
+    rank = int(cfg.get("lowrank_rank", 32))
+    target_fraction = float(cfg.get("hard_fraction_target", 0.20))
+    min_fraction = float(cfg.get("hard_fraction_min", 0.15))
+    max_fraction = float(cfg.get("hard_fraction_max", 0.25))
+    rpca_topk = int(cfg.get("rpca_topk_cols_per_row", 16))
+    rpca_max_iter = int(cfg.get("rpca_max_iter", 100))
+
+    if condition == "b1":
+        return g_grpo, {
+            "hard_fraction": 0.0,
+            "recon_error": 0.0,
+            "routing_svd_seconds": 0.0,
+            "routing_source": "none",
+            "compressed_easy": False,
+        }
+    if condition == "b2":
+        return g_opd, {
+            "hard_fraction": 0.0,
+            "recon_error": 0.0,
+            "routing_svd_seconds": 0.0,
+            "routing_source": "none",
+            "compressed_easy": False,
+        }
+    if condition == "b3":
+        return g_joint, {
+            "hard_fraction": 0.0,
+            "recon_error": 0.0,
+            "routing_svd_seconds": 0.0,
+            "routing_source": "none",
+            "compressed_easy": False,
+        }
+
+    grpo_np = g_grpo.detach().cpu().numpy().astype(np.float32, copy=False)
+    opd_np = g_opd.detach().cpu().numpy().astype(np.float32, copy=False)
+    if condition in {"ours", "ours_minus"}:
+        route = grpo_sparse_support_mask(
+            grpo_np,
+            target_fraction=target_fraction,
+            min_fraction=min_fraction,
+            max_fraction=max_fraction,
+            rpca_topk_cols_per_row=rpca_topk,
+            rpca_max_iter=rpca_max_iter,
+        )
+        routing_source = "grpo_sparse_support"
+    elif condition == "b4":
+        route = opd_magnitude_mask(
+            opd_np,
+            target_fraction=target_fraction,
+            min_fraction=min_fraction,
+            max_fraction=max_fraction,
+        )
+        routing_source = "opd_magnitude"
+    elif condition == "b4b":
+        ours_route = grpo_sparse_support_mask(
+            grpo_np,
+            target_fraction=target_fraction,
+            min_fraction=min_fraction,
+            max_fraction=max_fraction,
+            rpca_topk_cols_per_row=rpca_topk,
+            rpca_max_iter=rpca_max_iter,
+        )
+        route = random_matched_mask(grpo_np.shape[0], ours_route.hard_fraction, rng)
+        routing_source = "random_matched_to_grpo_fraction"
+    else:
+        raise ValueError(f"Unknown condition: {condition}")
+
+    hard = torch.from_numpy(route.mask).to(device=g_opd.device, dtype=torch.bool)
+    delta = torch.empty_like(g_opd)
+    hard_delta = g_grpo + (1.0 - lambda_joint) * g_opd
+    delta[hard] = hard_delta[hard]
+
+    compressed_easy = bool(cfg.get("compress_easy_tokens", condition in {"ours", "b4"}))
+    recon_error = 0.0
+    easy = ~hard
+    if int(easy.sum().item()) > 0 and compressed_easy:
+        easy_np = opd_np[route.mask == 0]
+        recon, recon_error, kept_rank = lowrank_reconstruct(easy_np, rank, rng)
+        delta[easy] = torch.from_numpy(recon).to(device=g_opd.device, dtype=g_opd.dtype)
+    else:
+        kept_rank = 0
+        delta[easy] = g_opd[easy]
+
+    elapsed = time.perf_counter() - start
+    return delta, {
+        "hard_fraction": route.hard_fraction,
+        "recon_error": recon_error,
+        "routing_svd_seconds": elapsed,
+        "routing_source": routing_source,
+        "compressed_easy": compressed_easy,
+        "lowrank_rank_kept": kept_rank,
+        "route_threshold": route.threshold,
+        "rpca_rank": route.rpca_rank,
+        "rpca_iters": route.rpca_iters,
+        "rpca_recon_error": route.rpca_recon_error,
+        "route_energy_coverage": route.energy_coverage,
+    }
+
+
+def inject_logit_gradient(logits: torch.Tensor, grad_logits: torch.Tensor) -> None:
+    logits.backward(gradient=grad_logits)
+
+
+def grad_norm(model) -> float:
+    total = 0.0
+    for param in model.parameters():
+        if param.grad is not None:
+            total += float(param.grad.detach().float().norm().item() ** 2)
+    return total**0.5
+
+
+def train_one_step(
+    student,
+    teacher,
+    tokenizer,
+    example,
+    optimizer,
+    cfg: dict[str, Any],
+    condition: ConditionId,
+    rng: np.random.Generator,
+) -> StepResult:
+    step_start = time.perf_counter()
+    device = torch.device(cfg["student_device"])
+    student.eval()
+    prompt = build_prompt(example.question)
+    sequences_cpu, prompt_len, _generated_cpu, texts = generate_group(
+        student,
+        tokenizer,
+        prompt=prompt,
+        group_size=int(cfg["group_size"]),
+        max_prompt_tokens=int(cfg["max_prompt_tokens"]),
+        max_new_tokens=int(cfg["max_new_tokens"]),
+        temperature=float(cfg["temperature"]),
+        top_p=float(cfg["top_p"]),
+        device=cfg["student_device"],
+    )
+    rewards = [gsm8k_reward(text, example.answer) for text in texts]
+    advantages = group_advantages(rewards)
+
+    teacher_probs_cpu, teacher_token_ids, teacher_valid_cpu = token_distributions(
+        teacher, sequences_cpu, prompt_len, cfg["teacher_device"], tokenizer.pad_token_id
+    )
+
+    student.train()
+    optimizer.zero_grad(set_to_none=True)
+    sequences = sequences_cpu.to(device)
+    outputs = student(sequences)
+    logits = outputs.logits[:, prompt_len - 1 : -1, :].float()
+    probs = F.softmax(logits, dim=-1)
+    token_ids = sequences[:, prompt_len:]
+    if not torch.equal(token_ids.detach().cpu(), teacher_token_ids):
+        raise RuntimeError("Teacher/student token id mismatch on shared rollout.")
+    valid_mask = valid_generation_mask(student, token_ids, tokenizer.pad_token_id)
+    valid_mask = valid_mask & teacher_valid_cpu.to(device)
+    teacher_probs = teacher_probs_cpu.to(device=device, dtype=torch.float32)
+
+    g_grpo, g_opd, g_joint, _flat_tokens = build_component_gradients(
+        probs=probs,
+        teacher_probs=teacher_probs,
+        token_ids=token_ids,
+        valid_mask=valid_mask,
+        rollout_advantages=advantages,
+        lambda_joint=float(cfg["lambda_joint"]),
+    )
+    delta, route_meta = select_condition_delta(condition, g_grpo, g_opd, g_joint, cfg, rng)
+    grad_logits = torch.zeros_like(logits, dtype=torch.float32)
+    if int(valid_mask.sum().item()) > 0:
+        grad_logits[valid_mask] = delta / float(valid_mask.sum().item())
+
+    token_entropy = -(probs[valid_mask].clamp_min(1e-30) * probs[valid_mask].clamp_min(1e-30).log()).sum(dim=-1)
+    kl = (
+        probs[valid_mask].clamp_min(1e-30)
+        * (probs[valid_mask].clamp_min(1e-30).log() - teacher_probs[valid_mask].clamp_min(1e-30).log())
+    ).sum(dim=-1)
+    loss_proxy = float((logits.detach()[valid_mask] * grad_logits.detach()[valid_mask]).sum().item())
+    inject_logit_gradient(logits, grad_logits)
+    gnorm = grad_norm(student)
+    optimizer.step()
+
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        peak_memory = torch.cuda.max_memory_allocated(device) / (1024**2)
+        torch.cuda.reset_peak_memory_stats(device)
+    else:
+        peak_memory = 0.0
+
+    return StepResult(
+        loss_proxy=loss_proxy,
+        reward_mean=float(np.mean(rewards)) if rewards else 0.0,
+        pass_at_group_proxy=float(any(r > 0.0 for r in rewards)),
+        hard_fraction=float(route_meta["hard_fraction"]),
+        recon_error=float(route_meta["recon_error"]),
+        routing_svd_seconds=float(route_meta["routing_svd_seconds"]),
+        entropy=float(token_entropy.mean().item()) if token_entropy.numel() else 0.0,
+        kl_to_teacher=float(kl.mean().item()) if kl.numel() else 0.0,
+        grad_norm=gnorm,
+        peak_memory_mb=peak_memory,
+        wall_seconds=time.perf_counter() - step_start,
+    )
+
+
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_e2e_config(args.config)
+    if args.condition:
+        cfg["condition"] = args.condition
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+    if args.num_steps is not None:
+        cfg["num_steps"] = args.num_steps
+    condition = str(cfg["condition"]).lower()
+    if condition not in CONDITIONS:
+        raise ValueError(f"condition must be one of {sorted(CONDITIONS)}, got {condition}")
+    seed = int(cfg.get("seed", 42))
+    set_seed(seed)
+
+    output_template = str(cfg.get("output_dir") or f"runs/{condition}/{seed}")
+    output_dir = Path(args.output_dir or output_template.format(condition=condition, seed=seed))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "resolved_config.json").open("w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+    tokenizer = load_tokenizer(cfg["student_model"])
+    teacher_tokenizer = load_tokenizer(cfg["teacher_model"])
+    if tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
+        raise RuntimeError("Student and teacher tokenizers differ. This experiment requires a shared tokenizer.")
+
+    student = load_trainable_student(cfg)
+    teacher = load_causal_lm(
+        cfg["teacher_model"],
+        device=cfg["teacher_device"],
+        dtype_name=cfg["teacher_dtype"],
+        four_bit=bool(cfg.get("teacher_4bit", False)),
+    )
+    optimizer = make_optimizer(student, cfg)
+    examples = load_prompt_examples(cfg["dataset"], cfg["dataset_split"], int(cfg["limit_prompts"]), seed)
+    rng = np.random.default_rng(seed)
+    num_steps = int(cfg.get("num_steps", len(examples)))
+    train_path = output_dir / "train.jsonl"
+    if train_path.exists():
+        train_path.unlink()
+
+    init_entropy: float | None = None
+    peak_pass_group = 0.0
+    collapse_flags: list[dict[str, Any]] = []
+    compressed_easy = bool(cfg.get("compress_easy_tokens", condition in {"ours", "b4"}))
+    rhash = rule_hash(condition, compressed_easy=compressed_easy, rank=int(cfg.get("lowrank_rank", 32)), lambda_joint=float(cfg["lambda_joint"]))
+    for step in trange(num_steps, desc=f"train {condition} seed={seed}"):
+        example = examples[step % len(examples)]
+        result = train_one_step(student, teacher, tokenizer, example, optimizer, cfg, condition, rng)  # type: ignore[arg-type]
+        if init_entropy is None:
+            init_entropy = result.entropy
+        peak_pass_group = max(peak_pass_group, result.pass_at_group_proxy)
+        collapse = False
+        if init_entropy and result.entropy < float(cfg.get("collapse_entropy_frac", 0.40)) * init_entropy:
+            collapse = True
+        if peak_pass_group > 0 and result.pass_at_group_proxy < peak_pass_group - float(cfg.get("collapse_pass8_drop", 0.25)):
+            collapse = True
+        if collapse:
+            collapse_flags.append({"step": step, "entropy": result.entropy, "pass_at_group_proxy": result.pass_at_group_proxy})
+        row = {
+            "step": step,
+            "condition": condition,
+            "seed": seed,
+            "prompt_idx": example.idx,
+            "rule_hash": rhash,
+            **result.__dict__,
+        }
+        append_jsonl(train_path, row)
+
+    with (output_dir / "collapse_flags.json").open("w", encoding="utf-8") as f:
+        json.dump(collapse_flags, f, indent=2, ensure_ascii=False)
+    if bool(cfg.get("save_model", False)):
+        model_dir = output_dir / "final_model"
+        student.save_pretrained(model_dir)
+        tokenizer.save_pretrained(model_dir)
+
+
+if __name__ == "__main__":
+    main()

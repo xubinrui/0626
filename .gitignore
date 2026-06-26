@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Keep the seed=42 smoke logs/results currently committed, but avoid accidental
+# large model checkpoints in future runs.
+runs/**/final_model/
+outputs/

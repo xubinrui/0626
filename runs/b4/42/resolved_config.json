@@ -1,0 +1,65 @@
+{
+  "student_model": "/data/liuhao/local_models/Qwen3_1B7_Instruct",
+  "teacher_model": "/data/qinhanyu/models/Qwen3-8B",
+  "dataset": "gsm8k",
+  "dataset_split": "train",
+  "limit_prompts": 1,
+  "num_steps": 1,
+  "seed": 42,
+  "seeds": [
+    42
+  ],
+  "group_size": 8,
+  "max_new_tokens": 32,
+  "max_prompt_tokens": 512,
+  "temperature": 0.8,
+  "top_p": 0.95,
+  "lambda_joint": 0.5,
+  "student_device": "cuda:0",
+  "teacher_device": "cuda:1",
+  "teacher_4bit": false,
+  "student_dtype": "bf16",
+  "teacher_dtype": "bf16",
+  "optimizer": "adamw",
+  "learning_rate": 1e-06,
+  "weight_decay": 0.0,
+  "gradient_checkpointing": true,
+  "save_model": false,
+  "hard_fraction_target": 0.2,
+  "hard_fraction_min": 0.15,
+  "hard_fraction_max": 0.25,
+  "lowrank_rank": 32,
+  "rpca_topk_cols_per_row": 16,
+  "rpca_max_iter": 100,
+  "collapse_entropy_frac": 0.4,
+  "collapse_pass8_drop": 0.25,
+  "pass_k": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "eval_temperature": 0.8,
+  "eval_top_p": 0.95,
+  "eval_max_new_tokens": 64,
+  "eval_datasets": [
+    {
+      "name": "gsm8k",
+      "split": "test",
+      "limit": 8
+    },
+    {
+      "name": "math",
+      "split": "test",
+      "limit": 8
+    },
+    {
+      "name": "aime2024",
+      "split": "train",
+      "limit": 8
+    }
+  ],
+  "condition": "b4",
+  "output_dir": "runs/b4/42",
+  "compress_easy_tokens": true
+}

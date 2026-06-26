@@ -1,0 +1,6 @@
+{
+  "extends": "e2e_base.json",
+  "condition": "ours",
+  "output_dir": "runs/ours/{seed}",
+  "compress_easy_tokens": true
+}

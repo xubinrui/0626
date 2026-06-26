@@ -1,0 +1,3 @@
+{"condition": "b1", "seed": 42, "dataset": "gsm8k", "n_examples": 6, "distinct_1": 0.1349721706864564, "distinct_2": 0.3519924098671727, "distinct_3": 0.48349514563106794, "self_bleu": 0.7180972091618187, "skipped": false, "pass_at_1": 0.16666666666666666, "pass_at_2": 0.5, "pass_at_4": 1.0, "pass_at_8": 1.0}
+{"condition": "b1", "seed": 42, "dataset": "math", "skipped": true, "reason": "no eval examples available"}
+{"condition": "b1", "seed": 42, "dataset": "aime2024", "skipped": true, "reason": "no eval examples available"}
