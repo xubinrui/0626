@@ -4,9 +4,10 @@ import random
 import re
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 
 
 @dataclass(frozen=True)
@@ -52,13 +53,7 @@ def load_prompt_examples(dataset: str, split: str, limit: int, seed: int) -> lis
         print("WARNING: OPD_GRPO_USE_FALLBACK_DATA=1, using built-in tiny GSM8K-style fallback.")
         rows = list(_FALLBACK_GSM8K)
     else:
-        try:
-            ds = load_dataset("gsm8k", "main", split=split)
-            rows = [{"question": row["question"], "answer": row["answer"]} for row in ds]
-        except Exception as exc:
-            print(f"WARNING: failed to load GSM8K from datasets hub/cache: {exc}")
-            print("WARNING: using built-in tiny GSM8K-style fallback for smoke testing only.")
-            rows = list(_FALLBACK_GSM8K)
+        rows = load_gsm8k_rows(split)
     indices = list(range(len(rows)))
     random.Random(seed).shuffle(indices)
     selected = indices[: min(limit, len(indices))]
@@ -74,6 +69,32 @@ def load_prompt_examples(dataset: str, split: str, limit: int, seed: int) -> lis
             )
         )
     return examples
+
+
+def load_gsm8k_rows(split: str) -> list[dict[str, str]]:
+    rows = load_gsm8k_rows_from_arrow_cache(split)
+    if rows:
+        return rows
+    if os.environ.get("OPD_GRPO_ALLOW_DATASET_NETWORK") == "1":
+        try:
+            ds = load_dataset("gsm8k", "main", split=split)
+            return [{"question": row["question"], "answer": row["answer"]} for row in ds]
+        except Exception as exc:
+            print(f"WARNING: failed to load GSM8K from datasets hub/cache: {exc}")
+    print("WARNING: using built-in tiny GSM8K-style fallback for smoke testing only.")
+    return list(_FALLBACK_GSM8K)
+
+
+def load_gsm8k_rows_from_arrow_cache(split: str) -> list[dict[str, str]]:
+    cache_root = Path(os.environ.get("OPD_GRPO_GSM8K_CACHE_DIR", "~/.cache/huggingface/datasets/gsm8k")).expanduser()
+    split_name = str(split).split("[")[0]
+    candidates = sorted(cache_root.glob(f"main/0.0.0/*/gsm8k-{split_name}.arrow"))
+    if not candidates:
+        return []
+    path = candidates[-1]
+    ds = Dataset.from_file(str(path))
+    print(f"Loaded GSM8K {split_name} from local arrow cache: {path}")
+    return [{"question": row["question"], "answer": row["answer"]} for row in ds]
 
 
 def build_prompt(question: str) -> str:
